@@ -1,0 +1,8 @@
+node_modules
+npm-debug.log
+.env
+.git
+.gitignore
+error.log
+error.txt
+temp_pdf_code.txt

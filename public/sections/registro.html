@@ -1,0 +1,82 @@
+<!-- Sección: Registro de Horas -->
+<section id="section-registro" class="section-view active">
+    <div class="section-container">
+        <!-- Header de la sección -->
+        <div class="section-header">
+            <button class="btn-back" id="btn-back-registro">
+                <span>← Volver</span>
+            </button>
+            <h1 class="section-title">⏱️ Registro de Horas</h1>
+        </div>
+
+        <!-- Formulario con efecto liquid glass -->
+        <div class="form-card">
+            <form id="form-registro" class="form-registro">
+                <!-- Fecha -->
+                <div class="form-group">
+                    <label for="fecha" class="form-label">📅 Fecha</label>
+                    <input type="date" id="fecha" name="fecha" class="form-input" required>
+                </div>
+
+                <!-- Parador/Zona -->
+                <div class="form-group">
+                    <label for="parador" class="form-label">🏢 Zona de Trabajo</label>
+                    <select id="parador" name="parador" class="form-input" required>
+                        <option value="">Selecciona una zona...</option>
+                        <option value="Coordinadora">Coordinadora</option>
+                        <option value="Habitaciones">Habitaciones</option>
+                        <option value="Guardia">Guardia</option>
+                        <option value="Zona 0">Zona 0</option>
+                        <option value="Zona SS">Zona SS</option>
+                        <option value="Lavanderia">Lavandería</option>
+                        <option value="Corps">Corps</option>
+                    </select>
+                </div>
+
+                <!-- Hora de Inicio -->
+                <div class="form-group">
+                    <label for="horaInicio" class="form-label">⏰ Hora de Inicio</label>
+                    <input type="time" id="horaInicio" name="horaInicio" class="form-input" required>
+                </div>
+
+                <!-- Hora de Fin -->
+                <div class="form-group">
+                    <label for="horaFin" class="form-label">⏰ Hora de Fin</label>
+                    <input type="time" id="horaFin" name="horaFin" class="form-input" required>
+                </div>
+
+                <!-- Total de Horas (calculado automáticamente) -->
+                <div class="form-group">
+                    <label for="totalHoras" class="form-label">⏳ Total de Horas</label>
+                    <input type="number" id="totalHoras" name="totalHoras" class="form-input" step="0.5" readonly
+                        placeholder="Se calcula automáticamente">
+                </div>
+
+                <!-- Notas (opcional) -->
+                <div class="form-group">
+                    <label for="notas" class="form-label">📝 Notas (opcional)</label>
+                    <textarea id="notas" name="notas" class="form-input form-textarea" rows="3"
+                        placeholder="Agrega notas sobre este registro..."></textarea>
+                </div>
+
+                <!-- Botones de acción -->
+                <div class="form-actions">
+                    <button type="submit" class="btn-premium large">
+                        <div class="button-outer">
+                            <div class="button-inner">
+                                <span>💾 Guardar Registro</span>
+                            </div>
+                        </div>
+                    </button>
+                    <button type="reset" class="btn-premium large secondary">
+                        <div class="button-outer">
+                            <div class="button-inner">
+                                <span>🔄 Limpiar</span>
+                            </div>
+                        </div>
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</section>

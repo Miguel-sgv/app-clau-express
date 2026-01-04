@@ -6,6 +6,8 @@ const path = require('path');
 const session = require('express-session');
 const { MongoStore } = require('connect-mongo');
 const User = require('./User');
+const { AccessLog, ModificationLog } = require('./Logs');
+const Message = require('./Message');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -36,15 +38,15 @@ mongoose.connect(MONGODB_URI)
     console.log(' Conectado a MongoDB');
 
     // Create admin user if it doesn't exist
-    const adminExists = await User.findOne({ username: 'claudia' });
+    const adminExists = await User.findOne({ username: 'admin' });
     if (!adminExists) {
       const admin = new User({
-        username: 'claudia',
+        username: 'admin',
         password: 'root',
         role: 'admin'
       });
       await admin.save();
-      console.log(' Usuario admin creado: claudia/root');
+      console.log('✅ Usuario admin creado: admin/root');
     }
   })
   .catch(err => console.error(' Error de conexión a MongoDB:', err));
@@ -72,11 +74,11 @@ const isAuthenticated = (req, res, next) => {
   }
 };
 
-// Middleware to check admin role
+// Middleware to check admin role (admin or supervisor)
 const isAdmin = async (req, res, next) => {
   try {
     const user = await User.findById(req.session.userId);
-    if (user && user.role === 'admin') {
+    if (user && (user.role === 'admin' || user.role === 'supervisor')) {
       next();
     } else {
       res.status(403).json({ error: 'Acceso denegado' });
@@ -94,21 +96,64 @@ app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
 
     const user = await User.findOne({ username: username.toLowerCase() });
+
+    // Log failed login attempt
     if (!user) {
+      await AccessLog.create({
+        username: username.toLowerCase(),
+        action: 'failed_login',
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent')
+      });
       return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
     }
 
     const isMatch = await user.comparePassword(password);
     if (!isMatch) {
+      await AccessLog.create({
+        username: user.username,
+        action: 'failed_login',
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent')
+      });
       return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
     }
+
+    // Check if user is active
+    if (!user.isActive) {
+      return res.status(403).json({ error: 'Usuario bloqueado. Contacte al administrador.' });
+    }
+
+    // Update last login and login count
+    user.lastLogin = new Date();
+    user.loginCount += 1;
+    await user.save();
+
+    // Log successful login
+    await AccessLog.create({
+      username: user.username,
+      action: 'login',
+      ipAddress: req.ip,
+      userAgent: req.get('user-agent')
+    });
 
     req.session.userId = user._id;
     req.session.username = user.username;
     req.session.role = user.role;
 
+    // Check if password change is required
+    if (user.mustChangePassword) {
+      return res.json({
+        success: true,
+        requirePasswordChange: true,
+        userId: user._id,
+        username: user.username
+      });
+    }
+
     res.json({
       success: true,
+      requirePasswordChange: false,
       user: {
         id: user._id,
         username: user.username,
@@ -116,18 +161,36 @@ app.post('/api/auth/login', async (req, res) => {
       }
     });
   } catch (error) {
+    console.error('Login error:', error);
     res.status(500).json({ error: 'Error al iniciar sesión' });
   }
 });
 
 // Logout
-app.post('/api/auth/logout', (req, res) => {
-  req.session.destroy((err) => {
-    if (err) {
-      return res.status(500).json({ error: 'Error al cerrar sesión' });
+app.post('/api/auth/logout', async (req, res) => {
+  try {
+    const username = req.session.username;
+
+    // Log logout
+    if (username) {
+      await AccessLog.create({
+        username: username,
+        action: 'logout',
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent')
+      });
     }
-    res.json({ success: true });
-  });
+
+    req.session.destroy((err) => {
+      if (err) {
+        return res.status(500).json({ error: 'Error al cerrar sesión' });
+      }
+      res.json({ success: true });
+    });
+  } catch (error) {
+    console.error('Logout error:', error);
+    res.status(500).json({ error: 'Error al cerrar sesión' });
+  }
 });
 
 // Get current user
@@ -137,6 +200,193 @@ app.get('/api/auth/me', isAuthenticated, async (req, res) => {
     res.json(user);
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener usuario' });
+  }
+});
+
+// Get current user (alias for frontend)
+app.get('/api/me', isAuthenticated, async (req, res) => {
+  try {
+    const user = await User.findById(req.session.userId).select('-password');
+    res.json({
+      success: true,
+      user: {
+        id: user._id,
+        username: user.username,
+        role: user.role,
+        phone: user.phone,
+        email: user.email,
+        avatar: user.avatar,
+        createdAt: user.createdAt
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Error al obtener usuario' });
+  }
+});
+
+// Change password (for first-time login or user request)
+app.post('/api/auth/change-password', async (req, res) => {
+  try {
+    const { userId, currentPassword, newPassword } = req.body;
+
+    // Validate new password
+    if (!newPassword || newPassword.length < 8) {
+      return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+    }
+
+    // Check for uppercase and number
+    if (!/[A-Z]/.test(newPassword) || !/[0-9]/.test(newPassword)) {
+      return res.status(400).json({ error: 'La contraseña debe incluir al menos una mayúscula y un número' });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    // Verify current password
+    const isMatch = await user.comparePassword(currentPassword);
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Contraseña actual incorrecta' });
+    }
+
+    // Update password
+    user.password = newPassword;
+    user.mustChangePassword = false;
+    await user.save();
+
+    // Create session
+    req.session.userId = user._id;
+    req.session.username = user.username;
+    req.session.role = user.role;
+
+    res.json({
+      success: true,
+      message: 'Contraseña actualizada correctamente',
+      user: {
+        id: user._id,
+        username: user.username,
+        role: user.role
+      }
+    });
+  } catch (error) {
+    console.error('Change password error:', error);
+    res.status(500).json({ error: 'Error al cambiar contraseña' });
+  }
+});
+
+// Update user profile (contact info and avatar)
+app.put('/api/profile', isAuthenticated, async (req, res) => {
+  try {
+    const { phone, email, avatar } = req.body;
+
+    const user = await User.findById(req.session.userId);
+    if (!user) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    // Update fields if provided
+    if (phone !== undefined) user.phone = phone;
+    if (email !== undefined) user.email = email;
+    if (avatar !== undefined) user.avatar = avatar;
+
+    await user.save();
+
+    res.json({
+      success: true,
+      message: 'Perfil actualizado correctamente',
+      user: {
+        phone: user.phone,
+        email: user.email,
+        avatar: user.avatar
+      }
+    });
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({ error: 'Error al actualizar perfil' });
+  }
+});
+
+// ===== PROFILE ROUTES =====
+
+// Get current user profile
+app.get('/api/me', isAuthenticated, async (req, res) => {
+  try {
+    const user = await User.findById(req.session.userId).select('-password');
+    res.json({
+      success: true,
+      user: user
+    });
+  } catch (error) {
+    console.error('Get profile error:', error);
+    res.status(500).json({ error: 'Error al obtener perfil' });
+  }
+});
+
+// Update user profile
+app.put('/api/profile', isAuthenticated, async (req, res) => {
+  try {
+    const { avatar, phone, email } = req.body;
+    const updateData = {};
+
+    // Only update fields that are provided
+    if (avatar !== undefined) updateData.avatar = avatar;
+    if (phone !== undefined) updateData.phone = phone;
+    if (email !== undefined) updateData.email = email;
+
+    const updatedUser = await User.findByIdAndUpdate(
+      req.session.userId,
+      updateData,
+      { new: true }
+    ).select('-password');
+
+    res.json({
+      success: true,
+      user: updatedUser
+    });
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({ error: 'Error al actualizar perfil' });
+  }
+});
+
+// Change password (for logged-in users)
+app.post('/api/change-password', isAuthenticated, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    // Validate new password
+    if (!newPassword || newPassword.length < 8) {
+      return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+    }
+
+    // Check for uppercase and number
+    if (!/[A-Z]/.test(newPassword) || !/[0-9]/.test(newPassword)) {
+      return res.status(400).json({ error: 'La contraseña debe incluir al menos una mayúscula y un número' });
+    }
+
+    const user = await User.findById(req.session.userId);
+    if (!user) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    // Verify current password
+    const isMatch = await user.comparePassword(currentPassword);
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Contraseña actual incorrecta' });
+    }
+
+    // Update password
+    user.password = newPassword;
+    await user.save();
+
+    res.json({
+      success: true,
+      message: 'Contraseña actualizada correctamente'
+    });
+  } catch (error) {
+    console.error('Change password error:', error);
+    res.status(500).json({ error: 'Error al cambiar contraseña' });
   }
 });
 
@@ -155,22 +405,44 @@ app.get('/api/users', isAuthenticated, isAdmin, async (req, res) => {
 // Create user
 app.post('/api/users', isAuthenticated, isAdmin, async (req, res) => {
   try {
-    const { username, password, role } = req.body;
+    const { username, password, role, phone, email } = req.body;
+
+    // Only the original 'admin' user can create admin or supervisor accounts
+    if ((role === 'admin' || role === 'supervisor') && req.session.username !== 'admin') {
+      return res.status(403).json({
+        error: 'Solo el administrador principal puede crear cuentas de administrador o supervisor'
+      });
+    }
 
     const existingUser = await User.findOne({ username: username.toLowerCase() });
     if (existingUser) {
       return res.status(400).json({ error: 'El usuario ya existe' });
     }
 
-    const newUser = new User({ username, password, role });
+    const newUser = new User({
+      username,
+      password,
+      role,
+      phone: phone || '',
+      email: email || '',
+      mustChangePassword: true, // Force password change on first login
+      createdBy: req.session.username
+    });
     await newUser.save();
 
     res.status(201).json({
-      id: newUser._id,
-      username: newUser.username,
-      role: newUser.role
+      success: true,
+      user: {
+        _id: newUser._id,
+        username: newUser.username,
+        role: newUser.role,
+        phone: newUser.phone,
+        email: newUser.email,
+        mustChangePassword: newUser.mustChangePassword
+      }
     });
   } catch (error) {
+    console.error('Create user error:', error);
     res.status(400).json({ error: 'Error al crear usuario' });
   }
 });
@@ -203,9 +475,368 @@ app.put('/api/users/:id', isAuthenticated, isAdmin, async (req, res) => {
 app.delete('/api/users/:id', isAuthenticated, isAdmin, async (req, res) => {
   try {
     await User.findByIdAndDelete(req.params.id);
-    res.json({ message: 'Usuario eliminado correctamente' });
+    res.json({ success: true, message: 'Usuario eliminado correctamente' });
   } catch (error) {
     res.status(500).json({ error: 'Error al eliminar usuario' });
+  }
+});
+
+// Toggle user status (block/unblock)
+app.put('/api/users/:id/toggle-status', isAuthenticated, isAdmin, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    user.isActive = !user.isActive;
+    await user.save();
+
+    res.json({
+      success: true,
+      user: {
+        username: user.username,
+        isActive: user.isActive
+      }
+    });
+  } catch (error) {
+    console.error('Toggle status error:', error);
+    res.status(500).json({ error: 'Error al cambiar estado del usuario' });
+  }
+});
+
+// Change user role
+app.put('/api/users/:id/role', isAuthenticated, isAdmin, async (req, res) => {
+  try {
+    const { role } = req.body;
+
+    // Only the original 'admin' user can assign admin or supervisor roles
+    if ((role === 'admin' || role === 'supervisor') && req.session.username !== 'admin') {
+      return res.status(403).json({
+        error: 'Solo el administrador principal puede asignar roles de administrador o supervisor'
+      });
+    }
+
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    user.role = role;
+    await user.save();
+
+    res.json({
+      success: true,
+      user: {
+        username: user.username,
+        role: user.role
+      }
+    });
+  } catch (error) {
+    console.error('Change role error:', error);
+    res.status(500).json({ error: 'Error al cambiar rol del usuario' });
+  }
+});
+
+// Reset user password
+app.put('/api/users/:id/reset-password', isAuthenticated, isAdmin, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    // Use simple generic temporary password
+    const tempPassword = 'Pass1234!';
+
+    user.password = tempPassword;
+    user.mustChangePassword = true;
+    await user.save();
+
+    res.json({
+      success: true,
+      temporaryPassword: tempPassword,
+      message: 'Contraseña reseteada. El usuario debe cambiarla en el próximo login.'
+    });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({ error: 'Error al resetear contraseña' });
+  }
+});
+
+// Get all records for a specific user (admin only)
+app.get('/api/users/:id/records', isAuthenticated, isAdmin, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    const records = await Record.find({ userId: req.params.id }).sort({ fecha: -1 });
+
+    res.json({
+      success: true,
+      username: user.username,
+      records: records
+    });
+  } catch (error) {
+    console.error('Get user records error:', error);
+    res.status(500).json({ error: 'Error al obtener registros del usuario' });
+  }
+});
+
+// Get access logs
+app.get('/api/logs/access', isAuthenticated, isAdmin, async (req, res) => {
+  try {
+    const { limit = 50, offset = 0, username } = req.query;
+
+    const query = username ? { username } : {};
+
+    const logs = await AccessLog.find(query)
+      .sort({ timestamp: -1 })
+      .limit(parseInt(limit))
+      .skip(parseInt(offset));
+
+    const total = await AccessLog.countDocuments(query);
+
+    res.json({
+      success: true,
+      logs: logs,
+      total: total
+    });
+  } catch (error) {
+    console.error('Get access logs error:', error);
+    res.status(500).json({ error: 'Error al obtener logs de acceso' });
+  }
+});
+
+// Get modification logs
+app.get('/api/logs/modifications', isAuthenticated, isAdmin, async (req, res) => {
+  try {
+    const { limit = 50, offset = 0, adminUsername } = req.query;
+
+    const query = adminUsername ? { adminUsername } : {};
+
+    const logs = await ModificationLog.find(query)
+      .sort({ timestamp: -1 })
+      .limit(parseInt(limit))
+      .skip(parseInt(offset));
+
+    const total = await ModificationLog.countDocuments(query);
+
+    res.json({
+      success: true,
+      logs: logs,
+      total: total
+    });
+  } catch (error) {
+    console.error('Get modification logs error:', error);
+    res.status(500).json({ error: 'Error al obtener logs de modificaciones' });
+  }
+});
+
+// ===== MESSAGE ROUTES =====
+
+// Get all conversations for current user
+app.get('/api/messages/conversations', isAuthenticated, async (req, res) => {
+  try {
+    const currentUsername = req.session.username;
+
+    // Find all messages where user is sender or receiver
+    const messages = await Message.find({
+      $or: [
+        { from: currentUsername },
+        { to: currentUsername }
+      ]
+    }).sort({ timestamp: -1 });
+
+    // Build conversations map
+    const conversationsMap = new Map();
+
+    for (const msg of messages) {
+      const otherUser = msg.from === currentUsername ? msg.to : msg.from;
+
+      if (!conversationsMap.has(otherUser)) {
+        // Count unread messages from this user
+        const unreadCount = await Message.countDocuments({
+          from: otherUser,
+          to: currentUsername,
+          isRead: false
+        });
+
+        conversationsMap.set(otherUser, {
+          username: otherUser,
+          lastMessage: msg.message.substring(0, 50) + (msg.message.length > 50 ? '...' : ''),
+          lastMessageTime: msg.timestamp,
+          unreadCount: unreadCount
+        });
+      }
+    }
+
+    // Convert map to array and sort by last message time
+    const conversations = Array.from(conversationsMap.values())
+      .sort((a, b) => b.lastMessageTime - a.lastMessageTime);
+
+    res.json({
+      success: true,
+      conversations: conversations
+    });
+  } catch (error) {
+    console.error('Get conversations error:', error);
+    res.status(500).json({ error: 'Error al obtener conversaciones' });
+  }
+});
+
+// Get messages with a specific user
+app.get('/api/messages/:username', isAuthenticated, async (req, res) => {
+  try {
+    const currentUsername = req.session.username;
+    const otherUsername = req.params.username.toLowerCase();
+
+    // Find all messages between these two users
+    const messages = await Message.find({
+      $or: [
+        { from: currentUsername, to: otherUsername },
+        { from: otherUsername, to: currentUsername }
+      ]
+    }).sort({ timestamp: 1 });
+
+    res.json({
+      success: true,
+      messages: messages
+    });
+  } catch (error) {
+    console.error('Get messages error:', error);
+    res.status(500).json({ error: 'Error al obtener mensajes' });
+  }
+});
+
+// Send a new message
+app.post('/api/messages', isAuthenticated, async (req, res) => {
+  try {
+    const { to, message } = req.body;
+    const from = req.session.username;
+
+    // Validate recipient exists
+    const recipient = await User.findOne({ username: to.toLowerCase() });
+    if (!recipient) {
+      return res.status(404).json({ error: 'Usuario destinatario no encontrado' });
+    }
+
+    // Create new message
+    const newMessage = new Message({
+      from: from,
+      to: to.toLowerCase(),
+      message: message.trim()
+    });
+
+    await newMessage.save();
+
+    res.status(201).json({
+      success: true,
+      message: newMessage
+    });
+  } catch (error) {
+    console.error('Send message error:', error);
+    res.status(500).json({ error: 'Error al enviar mensaje' });
+  }
+});
+
+// Mark messages as read
+app.put('/api/messages/:username/mark-read', isAuthenticated, async (req, res) => {
+  try {
+    const currentUsername = req.session.username;
+    const otherUsername = req.params.username.toLowerCase();
+
+    // Mark all messages from otherUsername to currentUsername as read
+    await Message.updateMany(
+      {
+        from: otherUsername,
+        to: currentUsername,
+        isRead: false
+      },
+      {
+        $set: { isRead: true }
+      }
+    );
+
+    res.json({
+      success: true,
+      message: 'Mensajes marcados como leídos'
+    });
+  } catch (error) {
+    console.error('Mark as read error:', error);
+    res.status(500).json({ error: 'Error al marcar mensajes como leídos' });
+  }
+});
+
+// Get unread message count
+app.get('/api/messages/unread/count', isAuthenticated, async (req, res) => {
+  try {
+    const currentUsername = req.session.username;
+
+    const count = await Message.countDocuments({
+      to: currentUsername,
+      isRead: false
+    });
+
+    res.json({
+      success: true,
+      count: count
+    });
+  } catch (error) {
+    console.error('Get unread count error:', error);
+    res.status(500).json({ error: 'Error al obtener contador de mensajes no leídos' });
+  }
+});
+
+// Get messages with admin (for regular users)
+app.get('/api/messages/admin', isAuthenticated, async (req, res) => {
+  try {
+    const currentUsername = req.session.username;
+
+    // Find all messages between current user and admin
+    const messages = await Message.find({
+      $or: [
+        { from: currentUsername, to: 'admin' },
+        { from: 'admin', to: currentUsername }
+      ]
+    }).sort({ timestamp: 1 });
+
+    res.json({
+      success: true,
+      messages: messages
+    });
+  } catch (error) {
+    console.error('Get admin messages error:', error);
+    res.status(500).json({ error: 'Error al obtener mensajes con admin' });
+  }
+});
+
+// Mark messages from admin as read
+app.put('/api/messages/admin/mark-read', isAuthenticated, async (req, res) => {
+  try {
+    const currentUsername = req.session.username;
+
+    // Mark all messages from admin to current user as read
+    await Message.updateMany(
+      {
+        from: 'admin',
+        to: currentUsername,
+        isRead: false
+      },
+      {
+        $set: { isRead: true }
+      }
+    );
+
+    res.json({
+      success: true,
+      message: 'Mensajes marcados como leídos'
+    });
+  } catch (error) {
+    console.error('Mark admin messages as read error:', error);
+    res.status(500).json({ error: 'Error al marcar mensajes como leídos' });
   }
 });
 
@@ -279,12 +910,292 @@ app.delete('/api/records/:id', isAuthenticated, async (req, res) => {
   }
 });
 
+// ===== ADMIN RECORD MANAGEMENT =====
+
+// Admin: Edit any user's record
+app.put('/api/records/:id/admin-edit', isAuthenticated, isAdmin, async (req, res) => {
+  try {
+    const record = await Record.findById(req.params.id).populate('userId', 'username');
+
+    if (!record) {
+      return res.status(404).json({ error: 'Registro no encontrado' });
+    }
+
+    // Store original data for logging
+    const originalData = {
+      fecha: record.fecha,
+      horaInicio: record.horaInicio,
+      horaFin: record.horaFin,
+      totalHoras: record.totalHoras,
+      parador: record.parador,
+      notas: record.notas
+    };
+
+    // Update record
+    const updatedRecord = await Record.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { new: true, runValidators: true }
+    ).populate('userId', 'username');
+
+    // Log the modification
+    const modLog = await ModificationLog.create({
+      adminUsername: req.session.username,
+      targetUsername: updatedRecord.userId.username,
+      recordId: updatedRecord._id,
+      action: 'edit',
+      changes: {
+        before: originalData,
+        after: req.body
+      },
+      reason: req.body.reason || ''
+    });
+
+    res.json({
+      success: true,
+      record: updatedRecord,
+      logId: modLog._id
+    });
+  } catch (error) {
+    console.error('Admin edit record error:', error);
+    res.status(500).json({ error: 'Error al editar registro' });
+  }
+});
+
+// Admin: Delete any user's record
+app.delete('/api/records/:id/admin-delete', isAuthenticated, isAdmin, async (req, res) => {
+  try {
+    const record = await Record.findById(req.params.id).populate('userId', 'username');
+
+    if (!record) {
+      return res.status(404).json({ error: 'Registro no encontrado' });
+    }
+
+    // Store record data for logging
+    const recordData = {
+      fecha: record.fecha,
+      horaInicio: record.horaInicio,
+      horaFin: record.horaFin,
+      totalHoras: record.totalHoras,
+      parador: record.parador,
+      notas: record.notas
+    };
+
+    // Log the deletion
+    const modLog = await ModificationLog.create({
+      adminUsername: req.session.username,
+      targetUsername: record.userId.username,
+      recordId: record._id,
+      action: 'delete',
+      changes: {
+        deleted: recordData
+      },
+      reason: req.body.reason || ''
+    });
+
+    // Delete the record
+    await Record.findByIdAndDelete(req.params.id);
+
+    res.json({
+      success: true,
+      message: 'Registro eliminado correctamente',
+      logId: modLog._id
+    });
+  } catch (error) {
+    console.error('Admin delete record error:', error);
+    res.status(500).json({ error: 'Error al eliminar registro' });
+  }
+});
+
+// ===== MESSAGING ROUTES =====
+
+// Get conversations list
+app.get('/api/messages/conversations', isAuthenticated, async (req, res) => {
+  try {
+    const currentUser = req.session.username;
+    const isAdmin = req.session.role === 'admin';
+
+    let conversations = [];
+
+    if (isAdmin) {
+      // Admin: get all users they've chatted with
+      const messages = await Message.find({
+        $or: [{ from: currentUser }, { to: currentUser }]
+      }).sort({ timestamp: -1 });
+
+      // Get unique users
+      const userSet = new Set();
+      messages.forEach(msg => {
+        const otherUser = msg.from === currentUser ? msg.to : msg.from;
+        userSet.add(otherUser);
+      });
+
+      // Build conversations array
+      for (const username of userSet) {
+        const lastMessage = await Message.findOne({
+          $or: [
+            { from: currentUser, to: username },
+            { from: username, to: currentUser }
+          ]
+        }).sort({ timestamp: -1 });
+
+        const unreadCount = await Message.countDocuments({
+          from: username,
+          to: currentUser,
+          isRead: false
+        });
+
+        conversations.push({
+          username,
+          lastMessage: lastMessage ? lastMessage.message : '',
+          lastTimestamp: lastMessage ? lastMessage.timestamp : null,
+          unreadCount
+        });
+      }
+    } else {
+      // Regular user: only conversation with admin
+      const lastMessage = await Message.findOne({
+        $or: [
+          { from: currentUser, to: 'admin' },
+          { from: 'admin', to: currentUser }
+        ]
+      }).sort({ timestamp: -1 });
+
+      const unreadCount = await Message.countDocuments({
+        from: 'admin',
+        to: currentUser,
+        isRead: false
+      });
+
+      conversations.push({
+        username: 'admin',
+        lastMessage: lastMessage ? lastMessage.message : '',
+        lastTimestamp: lastMessage ? lastMessage.timestamp : null,
+        unreadCount
+      });
+    }
+
+    res.json({ success: true, conversations });
+  } catch (error) {
+    console.error('Get conversations error:', error);
+    res.status(500).json({ error: 'Error al obtener conversaciones' });
+  }
+});
+
+// Get messages with specific user
+app.get('/api/messages/:username', isAuthenticated, async (req, res) => {
+  try {
+    const currentUser = req.session.username;
+    const otherUser = req.params.username.toLowerCase();
+
+    // Verify user exists
+    const userExists = await User.findOne({ username: otherUser });
+    if (!userExists) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    // Get messages
+    const messages = await Message.find({
+      $or: [
+        { from: currentUser, to: otherUser },
+        { from: otherUser, to: currentUser }
+      ]
+    }).sort({ timestamp: 1 });
+
+    // Mark messages as read
+    await Message.updateMany(
+      { from: otherUser, to: currentUser, isRead: false },
+      { isRead: true }
+    );
+
+    res.json({ success: true, messages });
+  } catch (error) {
+    console.error('Get messages error:', error);
+    res.status(500).json({ error: 'Error al obtener mensajes' });
+  }
+});
+
+// Send message
+app.post('/api/messages', isAuthenticated, async (req, res) => {
+  try {
+    const { to, message } = req.body;
+
+    if (!to || !message) {
+      return res.status(400).json({ error: 'Destinatario y mensaje son requeridos' });
+    }
+
+    if (message.trim().length === 0) {
+      return res.status(400).json({ error: 'El mensaje no puede estar vacío' });
+    }
+
+    if (message.length > 1000) {
+      return res.status(400).json({ error: 'El mensaje es demasiado largo (máx 1000 caracteres)' });
+    }
+
+    // Verify recipient exists
+    const recipient = await User.findOne({ username: to.toLowerCase() });
+    if (!recipient) {
+      return res.status(404).json({ error: 'Destinatario no encontrado' });
+    }
+
+    // Create message
+    const newMessage = new Message({
+      from: req.session.username,
+      to: to.toLowerCase(),
+      message: message.trim()
+    });
+
+    await newMessage.save();
+
+    res.status(201).json({
+      success: true,
+      message: newMessage
+    });
+  } catch (error) {
+    console.error('Send message error:', error);
+    res.status(500).json({ error: 'Error al enviar mensaje' });
+  }
+});
+
+// Get unread message count
+app.get('/api/messages/unread/count', isAuthenticated, async (req, res) => {
+  try {
+    const count = await Message.countDocuments({
+      to: req.session.username,
+      isRead: false
+    });
+
+    res.json({ success: true, count });
+  } catch (error) {
+    console.error('Get unread count error:', error);
+    res.status(500).json({ error: 'Error al obtener mensajes no leídos' });
+  }
+});
+
+// Mark conversation as read
+app.put('/api/messages/:username/mark-read', isAuthenticated, async (req, res) => {
+  try {
+    const otherUser = req.params.username.toLowerCase();
+
+    await Message.updateMany(
+      { from: otherUser, to: req.session.username, isRead: false },
+      { isRead: true }
+    );
+
+    res.json({ success: true, message: 'Mensajes marcados como leídos' });
+  } catch (error) {
+    console.error('Mark as read error:', error);
+    res.status(500).json({ error: 'Error al marcar mensajes como leídos' });
+  }
+});
+
 // Serve index.html for root route
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 // Start server
-app.listen(PORT, () => {
-  console.log(` Servidor corriendo en http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
+  console.log(`📱 Acceso desde red local: http://192.168.1.38:${PORT}`);
 });
