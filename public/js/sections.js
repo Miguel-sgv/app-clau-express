@@ -472,7 +472,7 @@ async function loadUsers() {
                 <td>${user.username}</td>
                 <td>
                     <span class="role-badge role-${user.role}">
-                        ${user.role === 'admin' ? 'Administrador' : 'Usuario'}
+                        ${user.role === 'admin' ? 'Administrador' : user.role === 'supervisor' ? 'Supervisor' : 'Usuario'}
                     </span>
                 </td>
                 <td>${new Date(user.createdAt).toLocaleDateString('es-ES')}</td>

@@ -412,6 +412,11 @@ body.light-theme .records-table tr:hover {
     color: #000;
 }
 
+.role-supervisor {
+    background: linear-gradient(135deg, #4A90E2, #357ABD);
+    color: #fff;
+}
+
 .role-user {
     background: linear-gradient(135deg, #B4B4B4, #E6E6E6);
     color: #000;
