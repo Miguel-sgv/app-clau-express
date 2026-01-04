@@ -235,6 +235,50 @@ async function checkAuth() {
     }
 }
 
+
+// ===== Browser Back Button Management =====
+// Prevent users from exiting the app when pressing back
+function initHistoryManagement() {
+    // Push initial state when app loads
+    if (!window.history.state || !window.history.state.isAppState) {
+        window.history.pushState({ isAppState: true, view: 'dashboard' }, '', window.location.href);
+    }
+
+    // Listen for back button
+    window.addEventListener('popstate', (event) => {
+        // If user tries to go back beyond the app, prevent it
+        if (!event.state || !event.state.isAppState) {
+            // Push them back into the app
+            window.history.pushState({ isAppState: true, view: 'dashboard' }, '', window.location.href);
+            // Show dashboard
+            showDashboard();
+        } else if (event.state.view !== 'dashboard') {
+            // If they're in a section, go back to dashboard
+            showDashboard();
+        }
+    });
+}
+
+// Update section loading to push history state
+function pushSectionState(sectionName) {
+    window.history.pushState({
+        isAppState: true,
+        view: 'section',
+        section: sectionName
+    }, '', window.location.href);
+}
+
+// Show dashboard function (to be called on back navigation)
+function showDashboard() {
+    const mainContent = document.getElementById('main-content');
+    const dashboardView = document.getElementById('dashboard-view');
+
+    if (mainContent && dashboardView) {
+        mainContent.innerHTML = '';
+        dashboardView.classList.remove('hidden');
+    }
+}
+
 // Settings Dropdown
 let settingsDropdownInitialized = false;
 
