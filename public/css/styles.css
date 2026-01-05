@@ -316,20 +316,20 @@ body {
 
 .login-header {
     display: flex;
-    justify-content: space-between;
+    justify-content: flex-start;
     align-items: center;
     margin-bottom: 2.5rem;
     position: relative;
     z-index: 2;
     padding: 0 0.5rem;
+    gap: 1rem;
 }
 
 .login-header .logo.login-variant {
-    transform: scale(1.1);
+    transform: scale(0.9);
     transform-origin: left center;
     cursor: default;
-    min-width: 280px;
-    /* Previene que se colapse */
+    /* Aligned to the left, reduced 10% */
 }
 
 .login-security-icon {
